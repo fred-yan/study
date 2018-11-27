@@ -394,18 +394,69 @@ func (rf *Raft) startLeaderPeerProcess(peerIndex int) {
 	ticker := time.NewTicker(LeaderPeerTickInterval)
 
 	// Initial heartbeat
-
 	lastEntrySent := time.Now()
-
 	for {
-
-
 		select {
 		case currentTime := <-ticker.C: // If traffic has been idle, we should send a heartbeat
 			if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
 				lastEntrySent = time.Now()
-
+				Logger.Printf("id %d start to send append log entries", rf.me)
+				rf.sendAppendEntries()
 			}
 		}
 	}
 }
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PreLogTerm   int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	Logger.Printf("id %d in term %d reveive log entry from learder %d", rf.me, rf.currentTerm, args.LeaderId)
+	// Append log entries todo
+	timeReceived := time.Now()
+
+	Logger.Printf("id %d in term %d and update heartbeattime to %f",rf.me, rf.currentTerm, timeReceived.Clock)
+	rf.heartBeatTime = timeReceived
+
+	reply.Term = rf.currentTerm
+	reply.Success = true
+}
+
+func (rf *Raft) sendAppendEntries() {
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: 0,
+		PreLogTerm:   rf.currentTerm,
+		Entries:      rf.log,
+		LeaderCommit: 0,
+	}
+
+	replies := make([]AppendEntriesReply, len(rf.peers))
+	rf.mu.Lock()
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go rf.AppendEntries(&args, &replies[i])
+		}
+	}
+	rf.mu.Unlock()
+}
+
+
+
+
+
+
+
+
