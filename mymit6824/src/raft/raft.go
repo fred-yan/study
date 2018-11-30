@@ -210,6 +210,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.state = Follower
 	rf.voteFor = args.CandidateId
 	rf.heartBeatTime = time.Now()  //first time approve the vote and update the heartbeat
+	Logger.Printf("id %d heartBeatTime is %f in request", rf.me, rf.heartBeatTime.UnixNano()/1000000.0)
 
 	reply.Term = args.Term
 	reply.VoteGranted = true
@@ -313,44 +314,77 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 
 func (rf *Raft) sendAppendEntries(server int) {
+	Logger.Printf("id %d send to %d in function sendAppendEntries before lock log entries", rf.me, server)
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	
-	
-	args := &AppendEntriesArgs{}
-	args.Term = rf.currentTerm
-	args.LeaderId = rf.me
-	args.PrevLogIndex = rf.nextIndex[server] - 1
-	if args.PrevLogIndex >= 0 {
-		args.PreLogTerm = rf.log[args.PrevLogIndex].Term
-	}
 
-	args.LeaderCommit = rf.commitIndex
-
-	//logSent := make(chan int)
-	reply := &AppendEntriesReply{}
-	rf.sendOnePeerAppendEntries(server, args, reply)
-	if reply.Term > rf.currentTerm {
-		rf.state = Follower
-		rf.currentTerm = reply.Term
+	//Logger.Printf("id %d send to %d in function sendAppendEntries after lock log entries", rf.me, server)
+	if rf.state != Leader {
+		Logger.Printf("id %d is not leader now and can not send append log entries", rf.me)
 		return
 	}
 
-	if !reply.Success {
-		rf.nextIndex[server] = args.PrevLogIndex - 1
+	// last log index of leader
+	var entries = []LogEntry{}
+	var preLogIndex, preLogTerm = 0, 0
+	lastLogIndex := len(rf.log) -1
+
+	if lastLogIndex > 0 && lastLogIndex >= rf.nextIndex[server] {
+		// the last log entry already sent, start from 0
+		preLogIndex = rf.nextIndex[server]
+		lastEntry := rf.log[preLogIndex]
+		preLogTerm = lastEntry.Term
+		entries = make([]LogEntry, len(rf.log)-preLogIndex)
+		copy(entries, rf.log[preLogIndex:])
+
+	} else { // we just send heartbeat
+		if len(rf.log) > 0 {
+			preLogIndex = rf.nextIndex[server]
+			lastEntry := rf.log[preLogIndex]
+			preLogTerm = lastEntry.Term
+		} else {
+			preLogIndex = -1
+		}
 	}
+
+	args := &AppendEntriesArgs{}
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+	args.PrevLogIndex = preLogIndex
+	args.PreLogTerm = preLogTerm
+	args.LeaderCommit = rf.commitIndex
+	rf.mu.Unlock()
+
+	//logSent := make(chan int)
+	reply := &AppendEntriesReply{}
+
+	ok := rf.sendOnePeerAppendEntries(server, args, reply)
+
+	rf.mu.Lock()
+	if !ok {
+		Logger.Printf("id %d send log to id %d have failed", rf.me, server)
+	} else if reply.Success{
+		Logger.Printf("id %d send log to id %d have successed", rf.me, server)
+		// todo update the log index
+	} else {
+		if reply.Term > rf.currentTerm {
+			Logger.Printf("id %d change from leader to fellower", rf.me)
+			rf.state = Follower
+			rf.currentTerm = reply.Term
+			rf.voteFor = -1
+		} else {
+			Logger.Printf("id %d send log to id %d: next index neet to update", rf.me, server)
+			rf.nextIndex[server] = args.PrevLogIndex - 1
+		}
+	}
+	rf.mu.Unlock()
 
 }
 
 
-func (rf *Raft) sendOnePeerAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) sendOnePeerAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
 	Logger.Printf("id %d start to send log to id %d and it's term is %d", rf.me, server, rf.currentTerm)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok {
-		return
-	} else {
-		Logger.Printf("id %d start to send log to id %d and it's term is %d failed", rf.me, server, rf.currentTerm)
-	}
+	return ok
 }
 
 
@@ -362,6 +396,7 @@ func (rf *Raft) startElectionProcess() {
 	rf.mu.Lock()
 	//Logger.Printf("id %d acquired lock in startElectionProcess", rf.me)
 	if rf.state != Leader && currentTime.Sub(rf.heartBeatTime) > electionTimeOut {
+		Logger.Printf("id %d currentTime is %f", rf.me, currentTime.UnixNano()/1000000.0)
 		Logger.Printf("id %d heartBeatTime is %f", rf.me, rf.heartBeatTime.UnixNano()/1000000.0)
 		Logger.Printf("currentTime - heartBeatTime = %f, election timeout %f", currentTime.Sub(rf.heartBeatTime).Seconds(), electionTimeOut.Seconds())
 		go rf.beginElection()
@@ -439,7 +474,7 @@ func (rf *Raft) beginElection() {
 func (rf *Raft) promoteToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	
+
 	rf.state = Leader
 
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -451,7 +486,6 @@ func (rf *Raft) promoteToLeader() {
 			rf.matchIndex[i] = 0              // Index of highest log entry known to be replicated on server
 
 			// Start routines for each peer which will be used to monitor and send log entries
-			Logger.Printf("leader %d  start peer process", rf.me)
 			go rf.startLeaderPeerProcess(i)
 		}
 	}
@@ -462,24 +496,17 @@ const LeaderPeerTickInterval = 10 * time.Millisecond
 const HeartBeatInterval = 100 * time.Millisecond
 
 func (rf *Raft) startLeaderPeerProcess(peerIndex int) {
+	Logger.Printf("leader %d  start peer process and send log to id %d", rf.me, peerIndex)
 	ticker := time.NewTicker(LeaderPeerTickInterval)
 
 	// Initial heartbeat
 	lastEntrySent := time.Now()
 	for {
-		rf.mu.Lock()
-		if rf.state != Leader {
-			Logger.Printf("id %d is not leader now and can not send append log entries", rf.me)
-			ticker.Stop()
-			return
-		}
-		rf.mu.Unlock()
-		
 		select {
 		case currentTime := <-ticker.C: // If traffic has been idle, we should send a heartbeat
 			if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
 				lastEntrySent = time.Now()
-				Logger.Printf("id %d start to send append log entries", rf.me)
+				Logger.Printf("id %d start to send append log entries to id %d", rf.me, peerIndex)
 				rf.sendAppendEntries(peerIndex)
 			}
 		}
