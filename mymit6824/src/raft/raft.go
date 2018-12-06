@@ -210,7 +210,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.state = Follower
 	rf.voteFor = args.CandidateId
 	rf.heartBeatTime = time.Now()  //first time approve the vote and update the heartbeat
-	Logger.Printf("id %d heartBeatTime is %f in request", rf.me, rf.heartBeatTime.UnixNano()/1000000.0)
+	Logger.Printf("id %d heartBeatTime is %d in request", rf.me, uint64(rf.heartBeatTime.UnixNano()/1000000.0))
 
 	reply.Term = args.Term
 	reply.VoteGranted = true
@@ -261,7 +261,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Append log entries todo
 	timeReceived := time.Now()
 
-	Logger.Printf("id %d in term %d and update heartbeattime to %f",rf.me, rf.currentTerm, (timeReceived.UnixNano())/1000000.0)
+	Logger.Printf("id %d in term %d and update heartbeattime to %d",rf.me, rf.currentTerm, (timeReceived.UnixNano())/1000000.0)
 
 	rf.heartBeatTime = timeReceived
 
@@ -314,12 +314,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 
 func (rf *Raft) sendAppendEntries(server int) {
-	Logger.Printf("id %d send to %d in function sendAppendEntries before lock log entries", rf.me, server)
+	//Logger.Printf("id %d send to %d in function sendAppendEntries before lock log entries", rf.me, server)
 	rf.mu.Lock()
 
 	//Logger.Printf("id %d send to %d in function sendAppendEntries after lock log entries", rf.me, server)
 	if rf.state != Leader {
 		Logger.Printf("id %d is not leader now and can not send append log entries", rf.me)
+		rf.mu.Unlock()
 		return
 	}
 
@@ -364,7 +365,9 @@ func (rf *Raft) sendAppendEntries(server int) {
 		Logger.Printf("id %d send log to id %d have failed", rf.me, server)
 	} else if reply.Success{
 		Logger.Printf("id %d send log to id %d have successed", rf.me, server)
-		// todo update the log index
+		rf.matchIndex[server] = len(rf.log) - 1
+		rf.nextIndex[server] = len(rf.log)
+		rf.updateCommitIndex()
 	} else {
 		if reply.Term > rf.currentTerm {
 			Logger.Printf("id %d change from leader to fellower", rf.me)
@@ -388,6 +391,28 @@ func (rf *Raft) sendOnePeerAppendEntries(server int, args *AppendEntriesArgs, re
 }
 
 
+func (rf *Raft) updateCommitIndex() {
+	// §5.3/5.4: If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if v := rf.log[i]; v.Term == rf.currentTerm && i > rf.commitIndex {
+			replicationCount := 1
+			for j := range rf.peers {
+				if j != rf.me && rf.matchIndex[j] >= i {
+					if replicationCount++; replicationCount > len(rf.peers)/2 { // Check to see if majority of nodes have replicated this
+						Logger.Printf("Updating commit index [%d -> %d] as replication factor is at least: %d/%d",
+							rf, rf.commitIndex, i, replicationCount, len(rf.peers))
+						rf.commitIndex = i // Set index of this entry as new commit index
+						break
+					}
+				}
+			}
+		} else {
+			break
+		}
+	}
+}
+
+
 
 func (rf *Raft) startElectionProcess() {
 	electionTimeOut := (200 + time.Duration(rand.Intn(300)))*time.Millisecond
@@ -395,9 +420,9 @@ func (rf *Raft) startElectionProcess() {
 
 	rf.mu.Lock()
 	//Logger.Printf("id %d acquired lock in startElectionProcess", rf.me)
-	if rf.state != Leader && currentTime.Sub(rf.heartBeatTime) > electionTimeOut {
-		Logger.Printf("id %d currentTime is %f", rf.me, currentTime.UnixNano()/1000000.0)
-		Logger.Printf("id %d heartBeatTime is %f", rf.me, rf.heartBeatTime.UnixNano()/1000000.0)
+	if rf.state != Leader && currentTime.Sub(rf.heartBeatTime) >= electionTimeOut {
+		Logger.Printf("id %d currentTime is %d", rf.me, currentTime.UnixNano()/1000000.0)
+		Logger.Printf("id %d heartBeatTime is %d", rf.me, rf.heartBeatTime.UnixNano()/1000000.0)
 		Logger.Printf("currentTime - heartBeatTime = %f, election timeout %f", currentTime.Sub(rf.heartBeatTime).Seconds(), electionTimeOut.Seconds())
 		go rf.beginElection()
 	}
@@ -475,6 +500,7 @@ func (rf *Raft) promoteToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	Logger.Printf("id %d will be leader in term %d", rf.me, rf.currentTerm)
 	rf.state = Leader
 
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -533,7 +559,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	term = rf.currentTerm
+	state := rf.state
+	rf.mu.Unlock()
+	if state != Leader {
+		return -1, term, !isLeader
+	}
 
+	rf.mu.Lock()
+	if len(rf.log) > 0 {
+		index = len(rf.log)
+	} else {
+		index = 0
+	}
+
+	entry := LogEntry{Term:rf.currentTerm, Command:command}
+	rf.log = append(rf.log, entry)
+	Logger.Printf("leader %d in term %d append log entry %s", rf.me, rf.currentTerm, entry)
+	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
