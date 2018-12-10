@@ -41,6 +41,7 @@ type ApplyMsg struct {
 
 type LogEntry struct {
 	Term int
+	Index int
 	Command interface{}
 }
 
@@ -327,21 +328,26 @@ func (rf *Raft) sendAppendEntries(server int) {
 	// last log index of leader
 	var entries = []LogEntry{}
 	var preLogIndex, preLogTerm = 0, 0
-	lastLogIndex := len(rf.log) -1
+	lastLogIndex, _ := rf.getLastEntryInfo()
 
 	if lastLogIndex > 0 && lastLogIndex >= rf.nextIndex[server] {
 		// the last log entry already sent, start from 0
-		preLogIndex = rf.nextIndex[server]
-		lastEntry := rf.log[preLogIndex]
-		preLogTerm = lastEntry.Term
-		entries = make([]LogEntry, len(rf.log)-preLogIndex)
-		copy(entries, rf.log[preLogIndex:])
-
-	} else { // we just send heartbeat
-		if len(rf.log) > 0 {
-			preLogIndex = rf.nextIndex[server]
+		preLogIndex = rf.nextIndex[server] - 1
+		if preLogIndex >= 0 {
 			lastEntry := rf.log[preLogIndex]
 			preLogTerm = lastEntry.Term
+			entries = make([]LogEntry, len(rf.log)-rf.nextIndex[server])
+			copy(entries, rf.log[preLogIndex+1:])
+		} else {
+			lastEntry := rf.log[0]
+			preLogTerm = lastEntry.Term
+			entries = make([]LogEntry, len(rf.log))
+			copy(entries, rf.log[:])
+		}
+	} else { // we just send heartbeat
+		if len(rf.log) > 0 {
+			lastEntry := rf.log[len(rf.log) - 1]
+			preLogIndex, preLogTerm = lastEntry.Index, lastEntry.Term
 		} else {
 			preLogIndex = -1
 		}
@@ -352,7 +358,9 @@ func (rf *Raft) sendAppendEntries(server int) {
 	args.LeaderId = rf.me
 	args.PrevLogIndex = preLogIndex
 	args.PreLogTerm = preLogTerm
+	args.Entries = entries
 	args.LeaderCommit = rf.commitIndex
+
 	rf.mu.Unlock()
 
 	//logSent := make(chan int)
@@ -434,20 +442,35 @@ func (rf *Raft) startElectionProcess() {
 }
 
 
-func (rf *Raft) beginElection() {
-	rf.mu.Lock()  // rf state change, need to lock
-	//Logger.Printf("id %d acquired lock in beginElection_1", rf.me)
+func (rf *Raft) transitionToCandidate() {
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.voteFor = rf.me
+}
+
+func (rf *Raft) transitionToFollower(newTerm int) {
+	rf.state = Follower
+	rf.currentTerm = newTerm
+	rf.voteFor = -1
+}
+
+func (rf *Raft) getLastEntryInfo() (int, int) {
+	if len(rf.log) > 0 {
+		entry := rf.log[len(rf.log) - 1]
+		return entry.Index, entry.Term
+	}
+	return -1, -1
+}
+
+
+func (rf *Raft) beginElection() {
+	rf.mu.Lock()  // rf state change, need to lock
+	//Logger.Printf("id %d acquired lock in beginElection_1", rf.me)
+	rf.transitionToCandidate()
 
 	Logger.Printf("begin election")
-	lastLogIndex := 0
-	lastLogTerm := 0
-	if len(rf.log) > 0 {
-		lastLogIndex = len(rf.log) - 1
-		lastLogTerm = rf.log[lastLogIndex].Term
-	}
+	lastLogIndex, lastLogTerm := rf.getLastEntryInfo()
+
 	args := RequestVoteArgs{
 		Term: rf.currentTerm,
 		CandidateId: rf.voteFor,
@@ -473,16 +496,15 @@ func (rf *Raft) beginElection() {
 		//Logger.Printf("id %d acquired lock in beginElection_2", rf.me)
 		if reply.Term > rf.currentTerm {
 			Logger.Printf("id %d change from candidater to fellower of id %d", rf.me, id)
-			rf.currentTerm = reply.Term
-			rf.state = Follower
-			rf.voteFor = -1
+			rf.transitionToFollower(reply.Term)
+			rf.mu.Unlock()
+			break
 		} else if reply.VoteGranted {
 			votes += 1
 			if votes > len(replies)/2{
 				if rf.state == Candidate && rf.currentTerm == args.Term {
 					Logger.Printf("id %d start to promote to leader for term %d", rf.me, rf.currentTerm)
 					go rf.promoteToLeader()
-					Logger.Printf("id %d finish to promote to leader for term %d", rf.me, rf.currentTerm)
 					rf.mu.Unlock()
 					break
 				} else {
@@ -508,8 +530,11 @@ func (rf *Raft) promoteToLeader() {
 
 	for i := range rf.peers {
 		if i != rf.me {
-			rf.nextIndex[i] = len(rf.log) + 0// Should be initialized to leader's last log index + 1
-			rf.matchIndex[i] = 0              // Index of highest log entry known to be replicated on server
+			// init
+			rf.nextIndex[i] = len(rf.log) + 0 // should be initialized to leader's last log index + 1 and index start from 0
+			rf.matchIndex[i] = -1              // Index of highest log entry known to be replicated on server
+
+			Logger.Printf("=======id %d nextIndex is %d, matchIndex is %d", i, rf.nextIndex[i], rf.matchIndex[i])
 
 			// Start routines for each peer which will be used to monitor and send log entries
 			go rf.startLeaderPeerProcess(i)
@@ -621,6 +646,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
 	Logger.Printf("start election")
 	go rf.startElectionProcess()
 
