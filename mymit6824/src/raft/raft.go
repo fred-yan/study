@@ -258,7 +258,8 @@ func (rf *Raft) sendRequestVote(server int, vote chan int, args *RequestVoteArgs
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Logger.Printf("id %d in term %d reveive log entry from learder %d", rf.me, rf.currentTerm, args.LeaderId)
+	//time.Sleep(3*time.Second)
+	Logger.Printf("id %d in term %d reveive log entry %s from learder %d", rf.me, rf.currentTerm, args.Entries, args.LeaderId)
 	// Append log entries todo
 	timeReceived := time.Now()
 
@@ -267,30 +268,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.heartBeatTime = timeReceived
 
 	if args.Term < rf.currentTerm {
+		Logger.Printf("reply is failed because args.Term %d < rf.currentTerm %d", args.Term, rf.currentTerm)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	if args.PrevLogIndex < 0 {
-		rf.log = nil
-		reply.Term = rf.currentTerm
-		reply.Success = true
-		return
-	}
-
+	//Logger.Printf("id %d before append entry and log is %s",rf.me, rf.log)
 	if (len(rf.log)) > 0 {
+		Logger.Printf("id %d not first time append log and len log is %d", rf.me, len(rf.log))
 		index := len(rf.log) - 1
 		if args.PrevLogIndex > index {
+			Logger.Printf("id %d reply is failed because args.PrevLogIndex %d > index %d", rf.me, args.PrevLogIndex, index)
 			reply.Success = false
-			return
+
 		} else {
 			if rf.log[args.PrevLogIndex].Term != args.PreLogTerm {
+				Logger.Printf("reply is failed because .......")
 				reply.Success = false
-				rf.log = append(rf.log[:args.PrevLogIndex-1])
-				return
+				rf.log = append(rf.log[:args.PrevLogIndex+1])
+
 			} else {
-				rf.log = append(rf.log[:args.PrevLogIndex-1], args.Entries[:]...)
+				Logger.Printf("id %d from prelogindex %d append log entry %s", rf.me, args.PrevLogIndex, args.Entries)
+				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries[:]...)
 				if args.LeaderCommit > rf.commitIndex {
 					if args.LeaderCommit < len(rf.log) - 1 {
 						rf.commitIndex = args.LeaderCommit
@@ -298,18 +298,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 						rf.commitIndex = len(rf.log) - 1
 					}
 				}
+				reply.Success = true
 			}
 		}
 	} else {
 		index := 0
 		if args.PrevLogIndex > index {
+			Logger.Printf("reply is failed because ........................")
 			reply.Success = false
-			return
+
+		} else {
+			Logger.Printf("id %d first time append log %s",rf.me, args.Entries)
+			rf.log = args.Entries
+			if args.LeaderCommit > rf.commitIndex {
+				if args.LeaderCommit < len(rf.log) - 1 {
+					rf.commitIndex = args.LeaderCommit
+				} else {
+					rf.commitIndex = len(rf.log) - 1
+				}
+			}
+			reply.Success = true
+
 		}
 	}
 
-	reply.Term = rf.currentTerm
-	reply.Success = true
+	//Logger.Printf("id %d after append entry and log is %s",rf.me, rf.log)
+	reply.Term = args.Term
+	return
+
 }
 
 
@@ -320,7 +336,7 @@ func (rf *Raft) sendAppendEntries(server int) {
 
 	//Logger.Printf("id %d send to %d in function sendAppendEntries after lock log entries", rf.me, server)
 	if rf.state != Leader {
-		Logger.Printf("id %d is not leader now and can not send append log entries", rf.me)
+		Logger.Printf("id %d is %s not leader now and can not send append log entries", rf.me, rf.state)
 		rf.mu.Unlock()
 		return
 	}
@@ -329,10 +345,12 @@ func (rf *Raft) sendAppendEntries(server int) {
 	var entries = []LogEntry{}
 	var preLogIndex, preLogTerm = 0, 0
 	lastLogIndex, _ := rf.getLastEntryInfo()
+	//Logger.Printf("lastLogIndex is %d and rf.nextIndex[%d] is %d", lastLogIndex, server, rf.nextIndex[server])
 
-	if lastLogIndex > 0 && lastLogIndex >= rf.nextIndex[server] {
+	if lastLogIndex >= 0 && lastLogIndex >= rf.nextIndex[server] {
 		// the last log entry already sent, start from 0
 		preLogIndex = rf.nextIndex[server] - 1
+		//Logger.Printf("preLogIndex is %d ========= for id %d ", preLogIndex, server)
 		if preLogIndex >= 0 {
 			lastEntry := rf.log[preLogIndex]
 			preLogTerm = lastEntry.Term
@@ -354,6 +372,9 @@ func (rf *Raft) sendAppendEntries(server int) {
 	}
 
 	args := &AppendEntriesArgs{}
+	if len(args.Entries) > 0 {
+		Logger.Printf("append log entries is %s", args.Entries)
+	}
 	args.Term = rf.currentTerm
 	args.LeaderId = rf.me
 	args.PrevLogIndex = preLogIndex
@@ -361,20 +382,20 @@ func (rf *Raft) sendAppendEntries(server int) {
 	args.Entries = entries
 	args.LeaderCommit = rf.commitIndex
 
-	rf.mu.Unlock()
+	//rf.mu.Unlock()
 
 	//logSent := make(chan int)
 	reply := &AppendEntriesReply{}
 
 	ok := rf.sendOnePeerAppendEntries(server, args, reply)
 
-	rf.mu.Lock()
+	//rf.mu.Lock()
 	if !ok {
 		Logger.Printf("id %d send log to id %d have failed", rf.me, server)
 	} else if reply.Success{
-		Logger.Printf("id %d send log to id %d have successed", rf.me, server)
 		rf.matchIndex[server] = len(rf.log) - 1
 		rf.nextIndex[server] = len(rf.log)
+		//Logger.Printf("***************rf.nextIndex[%d] is %d*******", server, rf.nextIndex[server])
 		rf.updateCommitIndex()
 	} else {
 		if reply.Term > rf.currentTerm {
@@ -385,6 +406,7 @@ func (rf *Raft) sendAppendEntries(server int) {
 		} else {
 			Logger.Printf("id %d send log to id %d: next index neet to update", rf.me, server)
 			rf.nextIndex[server] = args.PrevLogIndex - 1
+			//Logger.Printf("***************rf.nextIndex[%d] is %d*******", server, rf.nextIndex[server])
 		}
 	}
 	rf.mu.Unlock()
@@ -393,7 +415,12 @@ func (rf *Raft) sendAppendEntries(server int) {
 
 
 func (rf *Raft) sendOnePeerAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
-	Logger.Printf("id %d start to send log to id %d and it's term is %d", rf.me, server, rf.currentTerm)
+	if len(args.Entries) > 0 {
+		Logger.Printf("id %d start to send log entry %s to id %d, reply is %s", rf.me, args.Entries, server, reply)
+	} else {
+		Logger.Printf("id %d only send heartbeat to id %d and it's term is %d", rf.me, server, rf.currentTerm)
+	}
+
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -401,14 +428,16 @@ func (rf *Raft) sendOnePeerAppendEntries(server int, args *AppendEntriesArgs, re
 
 func (rf *Raft) updateCommitIndex() {
 	// §5.3/5.4: If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+
 	for i := len(rf.log) - 1; i >= 0; i-- {
+		//Logger.Printf("*************rf.commitindex is %d", rf.commitIndex)
 		if v := rf.log[i]; v.Term == rf.currentTerm && i > rf.commitIndex {
 			replicationCount := 1
 			for j := range rf.peers {
 				if j != rf.me && rf.matchIndex[j] >= i {
 					if replicationCount++; replicationCount > len(rf.peers)/2 { // Check to see if majority of nodes have replicated this
-						Logger.Printf("Updating commit index [%d -> %d] as replication factor is at least: %d/%d",
-							rf, rf.commitIndex, i, replicationCount, len(rf.peers))
+						Logger.Printf("*************Updating commit index [%d -> %d] as replication factor is at least: %d/%d",
+							rf.commitIndex, i, replicationCount, len(rf.peers))
 						rf.commitIndex = i // Set index of this entry as new commit index
 						break
 					}
@@ -518,6 +547,7 @@ func (rf *Raft) beginElection() {
 
 }
 
+
 func (rf *Raft) promoteToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -557,7 +587,7 @@ func (rf *Raft) startLeaderPeerProcess(peerIndex int) {
 		case currentTime := <-ticker.C: // If traffic has been idle, we should send a heartbeat
 			if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
 				lastEntrySent = time.Now()
-				Logger.Printf("id %d start to send append log entries to id %d", rf.me, peerIndex)
+				//Logger.Printf("id %d start to send append log entries to id %d", rf.me, peerIndex)
 				rf.sendAppendEntries(peerIndex)
 			}
 		}
@@ -599,7 +629,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = 0
 	}
 
-	entry := LogEntry{Term:rf.currentTerm, Command:command}
+	entry := LogEntry{Term:rf.currentTerm, Index:index, Command:command}
 	rf.log = append(rf.log, entry)
 	Logger.Printf("leader %d in term %d append log entry %s", rf.me, rf.currentTerm, entry)
 	rf.mu.Unlock()
@@ -640,7 +670,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.voteFor = -1
 	rf.lastApplide = 0
-	rf.commitIndex = 0
+	rf.commitIndex = -1
 	rf.heartBeatTime = time.Unix(0,0)
 
 
