@@ -1,688 +1,452 @@
 package raft
 
 //
-// this is an outline of the API that raft must expose to
-// the service (or tester). see comments below for
-// each of these functions for more details.
+// support for Raft tester.
 //
-// rf = Make(...)
-//   create a new Raft server.
-// rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a Raft for its current term, and whether it thinks it is leader
-// ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
-//   should send an ApplyMsg to the service (or tester)
-//   in the same server.
+// we will use the original config.go to test your code for grading.
+// so, while you can modify this code to help you debug, please
+// test with the original before submitting.
 //
 
+import "labrpc"
+import "log"
 import "sync"
-import (
-	"labrpc"
-	"time"
-	"math/rand"
-)
+import "testing"
+import "runtime"
+import crand "crypto/rand"
+import "encoding/base64"
+import "sync/atomic"
+import "time"
+import "fmt"
 
-// import "bytes"
-// import "encoding/gob"
-
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make().
-//
-type ApplyMsg struct {
-	Index       int
-	Command     interface{}
-	UseSnapshot bool   // ignore for lab2; only used in lab3
-	Snapshot    []byte // ignore for lab2; only used in lab3
+func randstring(n int) string {
+	b := make([]byte, 2*n)
+	crand.Read(b)
+	s := base64.URLEncoding.EncodeToString(b)
+	return s[0:n]
 }
 
-type LogEntry struct {
-	Term int
-	Index int
-	Command interface{}
+type config struct {
+	mu        sync.Mutex
+	t         *testing.T
+	net       *labrpc.Network
+	n         int
+	done      int32 // tell internal threads to die
+	rafts     []*Raft
+	applyErr  []string // from apply channel readers
+	connected []bool   // whether each server is on the net
+	saved     []*Persister
+	endnames  [][]string    // the port file names each sends to
+	logs      []map[int]int // copy of each server's committed entries
 }
 
-type ServerState string
+var ncpu_once sync.Once
 
-const (
-	Follower  ServerState = "Follower"
-	Candidate             = "Candidate"
-	Leader                = "Leader"
-)
-
-//
-// A Go object implementing a single Raft peer.
-//
-type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
-	state ServerState
-
-	//Persistent state on all servers
-	currentTerm int
-	voteFor     int
-	log         []LogEntry
-
-	//Volatile state on all servers
-	commitIndex int
-	lastApplide int
-
-	//Volatile state on leaders
-	nextIndex  []int
-	matchIndex []int
-
-	// when receive the heartbeat
-	heartBeatTime time.Time
-}
-
-// return currentTerm and whether this server
-// believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	term = rf.currentTerm
-	isleader = rf.state == Leader
-	return term, isleader
-}
-
-//
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
-}
-
-//
-// restore previously persisted state.
-//
-func (rf *Raft) readPersist(data []byte) {
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-}
-
-
-
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int
-	VoteGranted bool
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PreLogTerm   int
-	Entries      []LogEntry
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	Logger.Printf("id %d receive a request vote from candidate %d and term is %d ", rf.me, args.CandidateId, args.Term)
-	// Reply false if term < currentTerm
-	if args.Term < rf.currentTerm {
-		return
-	}
-
-	// If votedFor is null or candidateId, and candidate’s log is at
-	// least as up-to-date as receiver’s log, grant vot
-	if rf.voteFor == -1 || rf.voteFor == args.CandidateId {
-		rfLastIndex := len(rf.log) -1
-		if rfLastIndex >= 0 {
-			if rf.log[rfLastIndex].Term > args.LastLogTerm {
-				Logger.Printf("id %d refused vote for it's log last entry's term %d bigger than request's log term %d ",
-					rf.me, rf.log[rfLastIndex].Term, args.LastLogTerm)
-				return
-			}
-
-			if rf.log[rfLastIndex].Term == args.LastLogTerm {
-				if rfLastIndex > args.LastLogIndex {
-					Logger.Printf("id %d refused vote for it's log last entry's index %d bigger than request's log index %d ",
-						rf.me, rfLastIndex, args.LastLogIndex)
-					return
-				}
-			}
+func make_config(t *testing.T, n int, unreliable bool) *config {
+	ncpu_once.Do(func() {
+		if runtime.NumCPU() < 2 {
+			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")
 		}
+	})
+	runtime.GOMAXPROCS(4)
+	cfg := &config{}
+	cfg.t = t
+	cfg.net = labrpc.MakeNetwork()
+	cfg.n = n
+	cfg.applyErr = make([]string, cfg.n)
+	cfg.rafts = make([]*Raft, cfg.n)
+	cfg.connected = make([]bool, cfg.n)
+	cfg.saved = make([]*Persister, cfg.n)
+	cfg.endnames = make([][]string, cfg.n)
+	cfg.logs = make([]map[int]int, cfg.n)
+
+	cfg.setunreliable(unreliable)
+
+	cfg.net.LongDelays(true)
+
+	// create a full set of Rafts.
+	for i := 0; i < cfg.n; i++ {
+		cfg.logs[i] = map[int]int{}
+		cfg.start1(i)
 	}
 
-	Logger.Printf("id %d grant the request vote from candidate %d and update it's term to %d",
-		rf.me, args.CandidateId, args.Term)
-	rf.currentTerm = args.Term
-	rf.state = Follower
-	rf.voteFor = args.CandidateId
-	rf.heartBeatTime = time.Now()  //first time approve the vote and update the heartbeat
-	Logger.Printf("id %d heartBeatTime is %d in request", rf.me, uint64(rf.heartBeatTime.UnixNano()/1000000.0))
+	// connect everyone
+	for i := 0; i < cfg.n; i++ {
+		cfg.connect(i)
+	}
 
-	reply.Term = args.Term
-	reply.VoteGranted = true
+	return cfg
+}
+
+// shut down a Raft server but save its persistent state.
+func (cfg *config) crash1(i int) {
+	cfg.disconnect(i)
+	cfg.net.DeleteServer(i) // disable client connections to the server.
+
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
+
+	// a fresh persister, in case old instance
+	// continues to update the Persister.
+	// but copy old persister's content so that we always
+	// pass Make() the last persisted state.
+	if cfg.saved[i] != nil {
+		cfg.saved[i] = cfg.saved[i].Copy()
+	}
+
+	rf := cfg.rafts[i]
+	if rf != nil {
+		cfg.mu.Unlock()
+		rf.Kill()
+		cfg.mu.Lock()
+		cfg.rafts[i] = nil
+	}
+
+	if cfg.saved[i] != nil {
+		raftlog := cfg.saved[i].ReadRaftState()
+		cfg.saved[i] = &Persister{}
+		cfg.saved[i].SaveRaftState(raftlog)
+	}
 }
 
 //
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
+// start or re-start a Raft.
+// if one already exists, "kill" it first.
+// allocate new outgoing port file names, and a new
+// state persister, to isolate previous instance of
+// this server. since we cannot really kill it.
 //
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, vote chan int, args *RequestVoteArgs, reply *RequestVoteReply)  {
-	Logger.Printf("id %d start to send request vote and it's term is %d", rf.me, rf.currentTerm)
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if ok {
-		vote <- server
-	}
-}
+func (cfg *config) start1(i int) {
+	cfg.crash1(i)
 
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	//time.Sleep(3*time.Second)
-	Logger.Printf("id %d in term %d reveive log entry %s from learder %d", rf.me, rf.currentTerm, args.Entries, args.LeaderId)
-	// Append log entries todo
-	timeReceived := time.Now()
-
-	Logger.Printf("id %d in term %d and update heartbeattime to %d",rf.me, rf.currentTerm, (timeReceived.UnixNano())/1000000.0)
-
-	rf.heartBeatTime = timeReceived
-
-	if args.Term < rf.currentTerm {
-		Logger.Printf("reply is failed because args.Term %d < rf.currentTerm %d", args.Term, rf.currentTerm)
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		return
+	// a fresh set of outgoing ClientEnd names.
+	// so that old crashed instance's ClientEnds can't send.
+	cfg.endnames[i] = make([]string, cfg.n)
+	for j := 0; j < cfg.n; j++ {
+		cfg.endnames[i][j] = randstring(20)
 	}
 
-	//Logger.Printf("id %d before append entry and log is %s",rf.me, rf.log)
-	if (len(rf.log)) > 0 {
-		Logger.Printf("id %d not first time append log and len log is %d", rf.me, len(rf.log))
-		index := len(rf.log) - 1
-		if args.PrevLogIndex > index {
-			Logger.Printf("id %d reply is failed because args.PrevLogIndex %d > index %d", rf.me, args.PrevLogIndex, index)
-			reply.Success = false
+	// a fresh set of ClientEnds.
+	ends := make([]*labrpc.ClientEnd, cfg.n)
+	for j := 0; j < cfg.n; j++ {
+		ends[j] = cfg.net.MakeEnd(cfg.endnames[i][j])
+		cfg.net.Connect(cfg.endnames[i][j], j)
+	}
 
-		} else {
-			if rf.log[args.PrevLogIndex].Term != args.PreLogTerm {
-				Logger.Printf("reply is failed because .......")
-				reply.Success = false
-				rf.log = append(rf.log[:args.PrevLogIndex+1])
+	cfg.mu.Lock()
 
+	// a fresh persister, so old instance doesn't overwrite
+	// new instance's persisted state.
+	// but copy old persister's content so that we always
+	// pass Make() the last persisted state.
+	if cfg.saved[i] != nil {
+		cfg.saved[i] = cfg.saved[i].Copy()
+	} else {
+		cfg.saved[i] = MakePersister()
+	}
+
+	cfg.mu.Unlock()
+
+	// listen to messages from Raft indicating newly committed messages.
+	applyCh := make(chan ApplyMsg)
+	go func() {
+		for m := range applyCh {
+			err_msg := ""
+			if m.UseSnapshot {
+				// ignore the snapshot
+			} else if v, ok := (m.Command).(int); ok {
+				cfg.mu.Lock()
+				for j := 0; j < len(cfg.logs); j++ {
+					if old, oldok := cfg.logs[j][m.Index]; oldok && old != v {
+						// some server has already committed a different value for this entry!
+						err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
+							m.Index, i, m.Command, j, old)
+					}
+				}
+				_, prevok := cfg.logs[i][m.Index-1]
+				cfg.logs[i][m.Index] = v
+				cfg.mu.Unlock()
+
+				if m.Index > 1 && prevok == false {
+					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.Index)
+				}
 			} else {
-				Logger.Printf("id %d from prelogindex %d append log entry %s", rf.me, args.PrevLogIndex, args.Entries)
-				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries[:]...)
-				if args.LeaderCommit > rf.commitIndex {
-					if args.LeaderCommit < len(rf.log) - 1 {
-						rf.commitIndex = args.LeaderCommit
-					} else {
-						rf.commitIndex = len(rf.log) - 1
-					}
-				}
-				reply.Success = true
+				err_msg = fmt.Sprintf("committed command %v is not an int", m.Command)
+			}
+
+			if err_msg != "" {
+				log.Fatalf("apply error: %v\n", err_msg)
+				cfg.applyErr[i] = err_msg
+				// keep reading after error so that Raft doesn't block
+				// holding locks...
 			}
 		}
-	} else {
-		index := 0
-		if args.PrevLogIndex > index {
-			Logger.Printf("reply is failed because ........................")
-			reply.Success = false
+	}()
 
-		} else {
-			Logger.Printf("id %d first time append log %s",rf.me, args.Entries)
-			rf.log = args.Entries
-			if args.LeaderCommit > rf.commitIndex {
-				if args.LeaderCommit < len(rf.log) - 1 {
-					rf.commitIndex = args.LeaderCommit
-				} else {
-					rf.commitIndex = len(rf.log) - 1
-				}
-			}
-			reply.Success = true
+	rf := Make(ends, i, cfg.saved[i], applyCh)
 
-		}
-	}
+	cfg.mu.Lock()
+	cfg.rafts[i] = rf
+	cfg.mu.Unlock()
 
-	//Logger.Printf("id %d after append entry and log is %s",rf.me, rf.log)
-	reply.Term = args.Term
-	return
-
+	svc := labrpc.MakeService(rf)
+	srv := labrpc.MakeServer()
+	srv.AddService(svc)
+	cfg.net.AddServer(i, srv)
 }
 
-
-
-func (rf *Raft) sendAppendEntries(server int) {
-	//Logger.Printf("id %d send to %d in function sendAppendEntries before lock log entries", rf.me, server)
-	rf.mu.Lock()
-
-	//Logger.Printf("id %d send to %d in function sendAppendEntries after lock log entries", rf.me, server)
-	if rf.state != Leader {
-		Logger.Printf("id %d is %s not leader now and can not send append log entries", rf.me, rf.state)
-		rf.mu.Unlock()
-		return
-	}
-
-	// last log index of leader
-	var entries = []LogEntry{}
-	var preLogIndex, preLogTerm = 0, 0
-	lastLogIndex, _ := rf.getLastEntryInfo()
-	//Logger.Printf("lastLogIndex is %d and rf.nextIndex[%d] is %d", lastLogIndex, server, rf.nextIndex[server])
-
-	if lastLogIndex >= 0 && lastLogIndex >= rf.nextIndex[server] {
-		// the last log entry already sent, start from 0
-		preLogIndex = rf.nextIndex[server] - 1
-		//Logger.Printf("preLogIndex is %d ========= for id %d ", preLogIndex, server)
-		if preLogIndex >= 0 {
-			lastEntry := rf.log[preLogIndex]
-			preLogTerm = lastEntry.Term
-			entries = make([]LogEntry, len(rf.log)-rf.nextIndex[server])
-			copy(entries, rf.log[preLogIndex+1:])
-		} else {
-			lastEntry := rf.log[0]
-			preLogTerm = lastEntry.Term
-			entries = make([]LogEntry, len(rf.log))
-			copy(entries, rf.log[:])
-		}
-	} else { // we just send heartbeat
-		if len(rf.log) > 0 {
-			lastEntry := rf.log[len(rf.log) - 1]
-			preLogIndex, preLogTerm = lastEntry.Index, lastEntry.Term
-		} else {
-			preLogIndex = -1
+func (cfg *config) cleanup() {
+	for i := 0; i < len(cfg.rafts); i++ {
+		if cfg.rafts[i] != nil {
+			cfg.rafts[i].Kill()
 		}
 	}
-
-	args := &AppendEntriesArgs{}
-	if len(args.Entries) > 0 {
-		Logger.Printf("append log entries is %s", args.Entries)
-	}
-	args.Term = rf.currentTerm
-	args.LeaderId = rf.me
-	args.PrevLogIndex = preLogIndex
-	args.PreLogTerm = preLogTerm
-	args.Entries = entries
-	args.LeaderCommit = rf.commitIndex
-
-	//rf.mu.Unlock()
-
-	//logSent := make(chan int)
-	reply := &AppendEntriesReply{}
-
-	ok := rf.sendOnePeerAppendEntries(server, args, reply)
-
-	//rf.mu.Lock()
-	if !ok {
-		Logger.Printf("id %d send log to id %d have failed", rf.me, server)
-	} else if reply.Success{
-		rf.matchIndex[server] = len(rf.log) - 1
-		rf.nextIndex[server] = len(rf.log)
-		//Logger.Printf("***************rf.nextIndex[%d] is %d*******", server, rf.nextIndex[server])
-		rf.updateCommitIndex()
-	} else {
-		if reply.Term > rf.currentTerm {
-			Logger.Printf("id %d change from leader to fellower", rf.me)
-			rf.state = Follower
-			rf.currentTerm = reply.Term
-			rf.voteFor = -1
-		} else {
-			Logger.Printf("id %d send log to id %d: next index neet to update", rf.me, server)
-			rf.nextIndex[server] = args.PrevLogIndex - 1
-			//Logger.Printf("***************rf.nextIndex[%d] is %d*******", server, rf.nextIndex[server])
-		}
-	}
-	rf.mu.Unlock()
-
+	atomic.StoreInt32(&cfg.done, 1)
 }
 
+// attach server i to the net.
+func (cfg *config) connect(i int) {
+	// fmt.Printf("connect(%d)\n", i)
 
-func (rf *Raft) sendOnePeerAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool{
-	if len(args.Entries) > 0 {
-		Logger.Printf("id %d start to send log entry %s to id %d, reply is %s", rf.me, args.Entries, server, reply)
-	} else {
-		Logger.Printf("id %d only send heartbeat to id %d and it's term is %d", rf.me, server, rf.currentTerm)
+	cfg.connected[i] = true
+
+	// outgoing ClientEnds
+	for j := 0; j < cfg.n; j++ {
+		if cfg.connected[j] {
+			endname := cfg.endnames[i][j]
+			cfg.net.Enable(endname, true)
+		}
 	}
 
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
-
-func (rf *Raft) updateCommitIndex() {
-	// §5.3/5.4: If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
-
-	for i := len(rf.log) - 1; i >= 0; i-- {
-		//Logger.Printf("*************rf.commitindex is %d", rf.commitIndex)
-		if v := rf.log[i]; v.Term == rf.currentTerm && i > rf.commitIndex {
-			replicationCount := 1
-			for j := range rf.peers {
-				if j != rf.me && rf.matchIndex[j] >= i {
-					if replicationCount++; replicationCount > len(rf.peers)/2 { // Check to see if majority of nodes have replicated this
-						Logger.Printf("*************Updating commit index [%d -> %d] as replication factor is at least: %d/%d",
-							rf.commitIndex, i, replicationCount, len(rf.peers))
-						rf.commitIndex = i // Set index of this entry as new commit index
-						break
-					}
-				}
-			}
-		} else {
-			break
+	// incoming ClientEnds
+	for j := 0; j < cfg.n; j++ {
+		if cfg.connected[j] {
+			endname := cfg.endnames[j][i]
+			cfg.net.Enable(endname, true)
 		}
 	}
 }
 
+// detach server i from the net.
+func (cfg *config) disconnect(i int) {
+	// fmt.Printf("disconnect(%d)\n", i)
 
+	cfg.connected[i] = false
 
-func (rf *Raft) startElectionProcess() {
-	electionTimeOut := (200 + time.Duration(rand.Intn(300)))*time.Millisecond
-	currentTime := <- time.After(electionTimeOut)
-
-	rf.mu.Lock()
-	//Logger.Printf("id %d acquired lock in startElectionProcess", rf.me)
-	if rf.state != Leader && currentTime.Sub(rf.heartBeatTime) >= electionTimeOut {
-		Logger.Printf("id %d currentTime is %d", rf.me, currentTime.UnixNano()/1000000.0)
-		Logger.Printf("id %d heartBeatTime is %d", rf.me, rf.heartBeatTime.UnixNano()/1000000.0)
-		Logger.Printf("currentTime - heartBeatTime = %f, election timeout %f", currentTime.Sub(rf.heartBeatTime).Seconds(), electionTimeOut.Seconds())
-		go rf.beginElection()
-	}
-
-	//Logger.Printf("id %d start to release lock in startElectionProcess", rf.me)
-	rf.mu.Unlock()  // read rf state, need to lock
-
-	go rf.startElectionProcess()
-}
-
-
-func (rf *Raft) transitionToCandidate() {
-	rf.state = Candidate
-	rf.currentTerm++
-	rf.voteFor = rf.me
-}
-
-func (rf *Raft) transitionToFollower(newTerm int) {
-	rf.state = Follower
-	rf.currentTerm = newTerm
-	rf.voteFor = -1
-}
-
-func (rf *Raft) getLastEntryInfo() (int, int) {
-	if len(rf.log) > 0 {
-		entry := rf.log[len(rf.log) - 1]
-		return entry.Index, entry.Term
-	}
-	return -1, -1
-}
-
-
-func (rf *Raft) beginElection() {
-	rf.mu.Lock()  // rf state change, need to lock
-	//Logger.Printf("id %d acquired lock in beginElection_1", rf.me)
-	rf.transitionToCandidate()
-
-	Logger.Printf("begin election")
-	lastLogIndex, lastLogTerm := rf.getLastEntryInfo()
-
-	args := RequestVoteArgs{
-		Term: rf.currentTerm,
-		CandidateId: rf.voteFor,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm: lastLogTerm,
-	}
-
-	replies := make([]RequestVoteReply, len(rf.peers))
-	voteChan := make(chan int, len(rf.peers))
-	for i:=0; i<len(rf.peers); i++ {
-		if i != rf.me {
-			go rf.sendRequestVote(i, voteChan, &args, &replies[i])
+	// outgoing ClientEnds
+	for j := 0; j < cfg.n; j++ {
+		if cfg.endnames[i] != nil {
+			endname := cfg.endnames[i][j]
+			cfg.net.Enable(endname, false)
 		}
 	}
-	//Logger.Printf("id %d start to release lock in beginElection_1", rf.me)
-	rf.mu.Unlock()
 
-	votes := 1
-	for i := 0; i < len(replies); i++ {
-		id := <-voteChan
-		reply := replies[id]
-		rf.mu.Lock()
-		//Logger.Printf("id %d acquired lock in beginElection_2", rf.me)
-		if reply.Term > rf.currentTerm {
-			Logger.Printf("id %d change from candidater to fellower of id %d", rf.me, id)
-			rf.transitionToFollower(reply.Term)
-			rf.mu.Unlock()
-			break
-		} else if reply.VoteGranted {
-			votes += 1
-			if votes > len(replies)/2{
-				if rf.state == Candidate && rf.currentTerm == args.Term {
-					Logger.Printf("id %d start to promote to leader for term %d", rf.me, rf.currentTerm)
-					go rf.promoteToLeader()
-					rf.mu.Unlock()
-					break
-				} else {
-					Logger.Printf("id %d election for term %d was interrupted", rf.me, args.Term)
+	// incoming ClientEnds
+	for j := 0; j < cfg.n; j++ {
+		if cfg.endnames[j] != nil {
+			endname := cfg.endnames[j][i]
+			cfg.net.Enable(endname, false)
+		}
+	}
+}
+
+func (cfg *config) rpcCount(server int) int {
+	return cfg.net.GetCount(server)
+}
+
+func (cfg *config) setunreliable(unrel bool) {
+	cfg.net.Reliable(!unrel)
+}
+
+func (cfg *config) setlongreordering(longrel bool) {
+	cfg.net.LongReordering(longrel)
+}
+
+// check that there's exactly one leader.
+// try a few times in case re-elections are needed.
+func (cfg *config) checkOneLeader() int {
+	for iters := 0; iters < 10; iters++ {
+		time.Sleep(500 * time.Millisecond)
+		leaders := make(map[int][]int)
+		for i := 0; i < cfg.n; i++ {
+			if cfg.connected[i] {
+				if t, leader := cfg.rafts[i].GetState(); leader {
+					leaders[t] = append(leaders[t], i)
 				}
 			}
 		}
-		//Logger.Printf("id %d start to release lock in beginElection_2", rf.me)
-		rf.mu.Unlock()
-	}
 
-}
-
-
-func (rf *Raft) promoteToLeader() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	Logger.Printf("id %d will be leader in term %d", rf.me, rf.currentTerm)
-	rf.state = Leader
-
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
-
-	for i := range rf.peers {
-		if i != rf.me {
-			// init
-			rf.nextIndex[i] = len(rf.log) + 0 // should be initialized to leader's last log index + 1 and index start from 0
-			rf.matchIndex[i] = -1              // Index of highest log entry known to be replicated on server
-
-			Logger.Printf("=======id %d nextIndex is %d, matchIndex is %d", i, rf.nextIndex[i], rf.matchIndex[i])
-
-			// Start routines for each peer which will be used to monitor and send log entries
-			go rf.startLeaderPeerProcess(i)
-		}
-	}
-}
-
-
-const LeaderPeerTickInterval = 10 * time.Millisecond
-const HeartBeatInterval = 100 * time.Millisecond
-
-func (rf *Raft) startLeaderPeerProcess(peerIndex int) {
-	Logger.Printf("leader %d  start peer process and send log to id %d", rf.me, peerIndex)
-	ticker := time.NewTicker(LeaderPeerTickInterval)
-
-	// Initial heartbeat
-	lastEntrySent := time.Now()
-	for {
-		select {
-		case currentTime := <-ticker.C: // If traffic has been idle, we should send a heartbeat
-			if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
-				lastEntrySent = time.Now()
-				//Logger.Printf("id %d start to send append log entries to id %d", rf.me, peerIndex)
-				rf.sendAppendEntries(peerIndex)
+		lastTermWithLeader := -1
+		for t, leaders := range leaders {
+			if len(leaders) > 1 {
+				cfg.t.Fatalf("term %d has %d (>1) leaders", t, len(leaders))
+			}
+			if t > lastTermWithLeader {
+				lastTermWithLeader = t
 			}
 		}
+
+		if len(leaders) != 0 {
+			return leaders[lastTermWithLeader][0]
+		}
 	}
+	cfg.t.Fatalf("expected one leader, got none")
+	return -1
 }
 
-
-//
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-//
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
+// check that everyone agrees on the term.
+func (cfg *config) checkTerms() int {
 	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-	rf.mu.Lock()
-	term = rf.currentTerm
-	state := rf.state
-	rf.mu.Unlock()
-	if state != Leader {
-		return -1, term, !isLeader
+	for i := 0; i < cfg.n; i++ {
+		if cfg.connected[i] {
+			xterm, _ := cfg.rafts[i].GetState()
+			if term == -1 {
+				term = xterm
+			} else if term != xterm {
+				cfg.t.Fatalf("servers disagree on term")
+			}
+		}
 	}
+	return term
+}
 
-	rf.mu.Lock()
-	if len(rf.log) > 0 {
-		index = len(rf.log)
-	} else {
-		index = 0
+// check that there's no leader
+func (cfg *config) checkNoLeader() {
+	for i := 0; i < cfg.n; i++ {
+		if cfg.connected[i] {
+			_, is_leader := cfg.rafts[i].GetState()
+			if is_leader {
+				cfg.t.Fatalf("expected no leader, but %v claims to be leader", i)
+
+			}
+		}
 	}
-
-	entry := LogEntry{Term:rf.currentTerm, Index:index, Command:command}
-	rf.log = append(rf.log, entry)
-	Logger.Printf("leader %d in term %d append log entry %s", rf.me, rf.currentTerm, entry)
-	rf.mu.Unlock()
-
-	return index, term, isLeader
 }
 
-//
-// the tester calls Kill() when a Raft instance won't
-// be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
-// turn off debug output from this instance.
-//
-func (rf *Raft) Kill() {
-	// Your code here, if desired.
-}
-
-//
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-//
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-
-	// Your initialization code here (2A, 2B, 2C).
-	rf.state = Follower
-	rf.currentTerm = 0
-	rf.voteFor = -1
-	rf.lastApplide = 0
-	rf.commitIndex = -1
-	rf.heartBeatTime = time.Unix(0,0)
-
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
-	Logger.Printf("start election")
-	go rf.startElectionProcess()
-
-	return rf
+// check that there's state
+func (cfg *config) checkServerState() {
+	for i := 0; i < cfg.n; i++ {
+		if cfg.connected[i] {
+			cfg.t.Logf("id is %d, state is %s, term is %d", cfg.rafts[i].me, cfg.rafts[i].state, cfg.rafts[i].currentTerm)
+		}
+	}
 }
 
 
+// how many servers think a log entry is committed?
+func (cfg *config) nCommitted(index int) (int, interface{}) {
+	count := 0
+	cmd := -1
+	for i := 0; i < len(cfg.rafts); i++ {
+		if cfg.applyErr[i] != "" {
+			cfg.t.Fatal(cfg.applyErr[i])
+		}
 
+		cfg.mu.Lock()
+		cmd1, ok := cfg.logs[i][index]
+		cfg.mu.Unlock()
 
+		if ok {
+			if count > 0 && cmd != cmd1 {
+				cfg.t.Fatalf("committed values do not match: index %v, %v, %v\n",
+					index, cmd, cmd1)
+			}
+			count += 1
+			cmd = cmd1
+		}
+	}
+	return count, cmd
+}
+
+// wait for at least n servers to commit.
+// but don't wait forever.
+func (cfg *config) wait(index int, n int, startTerm int) interface{} {
+	to := 10 * time.Millisecond
+	for iters := 0; iters < 30; iters++ {
+		nd, _ := cfg.nCommitted(index)
+		if nd >= n {
+			break
+		}
+		time.Sleep(to)
+		if to < time.Second {
+			to *= 2
+		}
+		if startTerm > -1 {
+			for _, r := range cfg.rafts {
+				if t, _ := r.GetState(); t > startTerm {
+					// someone has moved on
+					// can no longer guarantee that we'll "win"
+					return -1
+				}
+			}
+		}
+	}
+	nd, cmd := cfg.nCommitted(index)
+	if nd < n {
+		cfg.t.Fatalf("only %d decided for index %d; wanted %d\n",
+			nd, index, n)
+	}
+	return cmd
+}
+
+// do a complete agreement.
+// it might choose the wrong leader initially,
+// and have to re-submit after giving up.
+// entirely gives up after about 10 seconds.
+// indirectly checks that the servers agree on the
+// same value, since nCommitted() checks this,
+// as do the threads that read from applyCh.
+// returns index.
+func (cfg *config) one(cmd int, expectedServers int) int {
+	fmt.Printf("start in one =====================\n")
+	t0 := time.Now()
+	starts := 0
+	looptime := 0
+	for time.Since(t0).Seconds() < 10 {
+		// try all the servers, maybe one is the leader.
+		index := -1
+		for si := 0; si < cfg.n; si++ {
+			starts = (starts + 1) % cfg.n
+			var rf *Raft
+			cfg.mu.Lock()
+			if cfg.connected[starts] {
+				rf = cfg.rafts[starts]
+			}
+			cfg.mu.Unlock()
+			if rf != nil {
+				index1, _, ok := rf.Start(cmd)
+				if rf.state == Leader {
+					looptime += 1
+					Logger.Printf("leader %d in term %d append log entry %s for  **** %d **** times, ok = %s", rf.me, rf.currentTerm, cmd, looptime, ok)
+				}
+
+				if ok {
+					index = index1
+					break
+				}
+			}
+		}
+
+		if index != -1 {
+			// somebody claimed to be the leader and to have
+			// submitted our command; wait a while for agreement.
+			t1 := time.Now()
+			for time.Since(t1).Seconds() < 2 {
+				nd, cmd1 := cfg.nCommitted(index)
+				//Logger.Printf("index is %d, nd is %d and cmd1 is %s", index, nd, cmd1)
+				if nd > 0 && nd >= expectedServers {
+					// committed
+					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
+						// and it was the command we submitted.
+						return index
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+	return -1
+}
