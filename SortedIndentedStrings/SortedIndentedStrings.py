@@ -37,25 +37,16 @@ def populate_entries(original_str):
             entry.key = str(item).strip()
             entry.level = level
             entry.children = []
-            add_entry(original_list, entry)
+            add_entry(original_list, entry, entry.level)
     return original_list
 
-def add_entry(list_of_entries: [], data: Entry):
-    if data.level == 0:
+def add_entry(list_of_entries: [], data: Entry, level):
+    if level == 0:
         list_of_entries.append(data)
     else:
-        level = 0
         append_entry = list_of_entries[-1]
-        list_of_append_entry = []
-        while data.level > level:
-            list_of_append_entry = append_entry.children
-            if list_of_append_entry:
-                append_entry = list_of_append_entry[-1]
-                level = append_entry.level
-            else:
-                break
-
-        list_of_append_entry.append(data)
+        list_of_append_entry = append_entry.children
+        add_entry(list_of_append_entry, data, level-1)
 
 
 def visit_process_list(p_list):
